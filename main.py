@@ -2146,7 +2146,15 @@ def api_ui_spoolman_spools(slot: str = "1A", printer_id: Optional[str] = None):
     elif has_cfs_snapshot:
         slot_present = False
     slot_material = (getattr(s, "material", "") or "").upper() if (s and slot_present) else ""
+    slot_vendor = (getattr(s, "manufacturer", "") or "").strip() if (s and slot_present) else ""
     slot_color = (getattr(s, "color_hex", "") or "").lower() if (s and slot_present) else ""
+    if isinstance(cfs_slot, dict) and slot_present:
+        cfs_material = str(cfs_slot.get("material") or "").strip().upper()
+        cfs_vendor = str(cfs_slot.get("manufacturer") or cfs_slot.get("vendor") or "").strip()
+        if cfs_material:
+            slot_material = cfs_material
+        if cfs_vendor:
+            slot_vendor = cfs_vendor
 
     try:
         raw = _spoolman_get_spools(base)
@@ -2183,7 +2191,13 @@ def api_ui_spoolman_spools(slot: str = "1A", printer_id: Optional[str] = None):
     for sp in spools:
         del sp["_score"]
 
-    return {"spools": spools, "slot": slot, "printer_id": pid}
+    return {
+        "spools": spools,
+        "slot": slot,
+        "printer_id": pid,
+        "preferred_material": slot_material,
+        "preferred_vendor": slot_vendor,
+    }
 
 
 @app.post("/api/ui/spoolman/link", response_model=ApiResponse)

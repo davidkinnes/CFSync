@@ -170,13 +170,48 @@ function recentJobSlotLabel(slotId) {
   return sid || "—";
 }
 
-function renderSpoolmanList(listEl, spools, selectedId = null) {
+function spoolmanMaterialNorm(v) {
+  return String(v || '').trim().toUpperCase();
+}
+
+function spoolmanVendorNorm(v) {
+  return String(v || '').trim().toLowerCase();
+}
+
+function spoolmanUniqueSorted(values) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of values) {
+    const v = String(raw || '').trim();
+    if (!v) continue;
+    const k = v.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(v);
+  }
+  out.sort((a, b) => a.localeCompare(b));
+  return out;
+}
+
+function spoolmanFilterSpools(spools, materialFilter, vendorFilter) {
+  const matNeed = spoolmanMaterialNorm(materialFilter);
+  const venNeed = spoolmanVendorNorm(vendorFilter);
+  return (Array.isArray(spools) ? spools : []).filter((sp) => {
+    const mat = spoolmanMaterialNorm(sp && sp.material);
+    const ven = spoolmanVendorNorm(sp && sp.vendor);
+    if (matNeed && mat !== matNeed) return false;
+    if (venNeed && ven !== venNeed) return false;
+    return true;
+  });
+}
+
+function renderSpoolmanList(listEl, spools, selectedId = null, emptyText = 'No spools found') {
   if (!listEl) return;
   listEl.innerHTML = '';
   if (!spools.length) {
     const o = document.createElement('div');
     o.className = 'spoolmanListItem muted';
-    o.textContent = 'No spools found';
+    o.textContent = emptyText;
     listEl.appendChild(o);
     return;
   }
@@ -212,6 +247,84 @@ function renderSpoolmanList(listEl, spools, selectedId = null) {
     const first = listEl.querySelector('.spoolmanListItem');
     if (first) first.classList.add('selected');
   }
+}
+
+function renderSpoolmanPicker({
+  listEl,
+  filtersEl,
+  spools,
+  selectedId = null,
+  preferredMaterial = '',
+  preferredVendor = '',
+  onVisibleCount = null,
+}) {
+  if (!listEl) return;
+  const all = Array.isArray(spools) ? spools : [];
+
+  const materials = spoolmanUniqueSorted(all.map(sp => spoolmanMaterialNorm(sp && sp.material)));
+  const vendors = spoolmanUniqueSorted(all.map(sp => String((sp && sp.vendor) || '').trim()));
+
+  let matValue = '';
+  let venValue = '';
+  const prefMat = spoolmanMaterialNorm(preferredMaterial);
+  if (prefMat && prefMat !== 'OTHER' && materials.includes(prefMat)) matValue = prefMat;
+  const prefVenKey = spoolmanVendorNorm(preferredVendor);
+  if (prefVenKey) {
+    const found = vendors.find(v => spoolmanVendorNorm(v) === prefVenKey);
+    if (found) venValue = found;
+  }
+
+  const repaint = () => {
+    const filtered = spoolmanFilterSpools(all, matValue, venValue);
+    const emptyText = all.length ? 'No matching spools' : 'No spools found';
+    renderSpoolmanList(listEl, filtered, selectedId, emptyText);
+    if (typeof onVisibleCount === 'function') onVisibleCount(filtered.length);
+  };
+
+  if (filtersEl) {
+    filtersEl.innerHTML = '';
+
+    const matSel = document.createElement('select');
+    matSel.className = 'spoolmanFilterSel';
+    const matAny = document.createElement('option');
+    matAny.value = '';
+    matAny.textContent = 'All materials';
+    matSel.appendChild(matAny);
+    for (const mat of materials) {
+      const o = document.createElement('option');
+      o.value = mat;
+      o.textContent = mat;
+      matSel.appendChild(o);
+    }
+    matSel.value = matValue;
+    matSel.addEventListener('change', () => {
+      matValue = matSel.value || '';
+      repaint();
+    });
+
+    const venSel = document.createElement('select');
+    venSel.className = 'spoolmanFilterSel';
+    const venAny = document.createElement('option');
+    venAny.value = '';
+    venAny.textContent = 'All brands';
+    venSel.appendChild(venAny);
+    for (const ven of vendors) {
+      const o = document.createElement('option');
+      o.value = ven;
+      o.textContent = ven;
+      venSel.appendChild(o);
+    }
+    venSel.value = venValue;
+    venSel.addEventListener('change', () => {
+      venValue = venSel.value || '';
+      repaint();
+    });
+
+    filtersEl.appendChild(matSel);
+    filtersEl.appendChild(venSel);
+  }
+
+  repaint();
 }
 
 // --- Spoolman integration ---
@@ -277,6 +390,8 @@ function closeEnvChartModal() {
 async function loadHistoryRelinkDropdown(ctx) {
   const list = $('historyRelinkSelect');
   if (!list) return;
+  const filters = $('historyRelinkFilters');
+  if (filters) filters.innerHTML = '';
   list.innerHTML = '';
   const ph = document.createElement('div');
   ph.className = 'spoolmanListItem muted';
@@ -291,9 +406,19 @@ async function loadHistoryRelinkDropdown(ctx) {
     if (!r.ok) throw new Error(await r.text());
     const data = await r.json();
     const spools = Array.isArray(data.spools) ? data.spools : [];
-    renderSpoolmanList(list, spools, ctx.currentSpoolId || null);
-    if (applyBtn) applyBtn.disabled = !spools.length;
+    renderSpoolmanPicker({
+      listEl: list,
+      filtersEl: filters,
+      spools,
+      selectedId: ctx.currentSpoolId || null,
+      preferredMaterial: ctx.material || data.preferred_material || '',
+      preferredVendor: ctx.manufacturer || data.preferred_vendor || '',
+      onVisibleCount: (count) => {
+        if (applyBtn) applyBtn.disabled = !count;
+      },
+    });
   } catch (e) {
+    if (filters) filters.innerHTML = '';
     list.innerHTML = '';
     const o = document.createElement('div');
     o.className = 'spoolmanListItem muted';
@@ -410,6 +535,10 @@ function openSpoolModal(slotId, meta, printerId) {
 async function loadSpoolmanDropdown(slotId, printerId) {
   const list = $('spoolmanSelect');
   if (!list) return;
+  const filters = $('spoolmanFilters');
+  if (filters) filters.innerHTML = '';
+  const linkBtn = $('spoolmanLink');
+  if (linkBtn) linkBtn.disabled = true;
   list.innerHTML = '';
   const ph = document.createElement('div');
   ph.className = 'spoolmanListItem muted';
@@ -421,13 +550,25 @@ async function loadSpoolmanDropdown(slotId, printerId) {
     if (!r.ok) throw new Error(await r.text());
     const data = await r.json();
     const spools = Array.isArray(data.spools) ? data.spools : [];
-    renderSpoolmanList(list, spools, null);
+    renderSpoolmanPicker({
+      listEl: list,
+      filtersEl: filters,
+      spools,
+      selectedId: null,
+      preferredMaterial: data.preferred_material || '',
+      preferredVendor: data.preferred_vendor || '',
+      onVisibleCount: (count) => {
+        if (linkBtn) linkBtn.disabled = !count;
+      },
+    });
   } catch (e) {
+    if (filters) filters.innerHTML = '';
     list.innerHTML = '';
     const o = document.createElement('div');
     o.className = 'spoolmanListItem muted';
     o.textContent = `Spoolman error: ${e.message || String(e)}`;
     list.appendChild(o);
+    if (linkBtn) linkBtn.disabled = true;
   }
 }
 
@@ -1493,6 +1634,8 @@ function renderRecentJobsCard(printers) {
             currentSpoolId: spoolId || null,
             grams: Number(s.grams || 0),
             meters: Number(s.meters || 0),
+            material: String(s.material || "").trim().toUpperCase(),
+            manufacturer: String(s.manufacturer || ""),
           });
         };
         spoolRow.appendChild(btn);

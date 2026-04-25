@@ -55,7 +55,7 @@
     </main>
 
     <!-- cache-bust: force clients to fetch latest app.js after updates -->
-    <script src="/static/app.js?v=20260320-1"></script>
+    <script src="/static/app.js?v=20260425-1"></script>
 
     <!-- Slot / Spool editor (local bookkeeping only; never talks to printer) -->
     <div id="spoolModal" class="modal" style="display:none;">
@@ -75,6 +75,7 @@
               <span id="spoolmanBadge" class="tag muted">not linked</span>
             </div>
             <div id="spoolmanNotLinked" class="spoolmanNotLinkedWrap">
+              <div id="spoolmanFilters" class="spoolmanFilters"></div>
               <div id="spoolmanSelect" class="spoolmanList"></div>
               <button id="spoolmanLink" class="btn">Link</button>
             </div>
@@ -110,6 +111,7 @@
               <span class="tag muted">Select spool</span>
             </div>
             <div class="spoolmanNotLinkedWrap">
+              <div id="historyRelinkFilters" class="spoolmanFilters"></div>
               <div id="historyRelinkSelect" class="spoolmanList"></div>
               <button id="historyRelinkApply" class="btn">Relink</button>
             </div>
