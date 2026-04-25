@@ -181,7 +181,7 @@ class SpoolmanUnlinkRequest(BaseModel):
 class JobReallocateSpoolRequest(BaseModel):
     printer_id: Optional[str] = None
     ended_at: float
-    slot: PrinterInputId
+    slot: str = Field(min_length=1)
     spoolman_id: int = Field(gt=0)
 
 

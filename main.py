@@ -1032,6 +1032,18 @@ _moon_job_track_slot_g: Dict[str, Dict[str, float]] = {}         # printer_id �
 _moon_job_track_slot_mm: Dict[str, Dict[str, float]] = {}        # printer_id → slot → mm
 _moon_job_started_at: Dict[str, float] = {}                       # printer_id → Unix timestamp
 _moon_job_name: Dict[str, str] = {}                               # printer_id → filename/job name
+_moon_history_last_sync: Dict[str, float] = {}                    # printer_id → last Moonraker history sync ts
+_MOON_HISTORY_SYNC_INTERVAL = 60.0
+_MOON_HISTORY_PAGE_LIMIT = 50
+_MOON_HISTORY_OVERLAP_SECS = 60.0
+_MOON_HISTORY_TERMINAL_STATES = frozenset({
+    "completed",
+    "cancelled",
+    "error",
+    "klippy_shutdown",
+    "klippy_disconnect",
+    "interrupted",
+})
 
 _VALID_CFS_SLOT_IDS = frozenset(
     f"{b}{l}" for b in "1234" for l in "ABCD"
@@ -1557,6 +1569,137 @@ async def printer_ws_loop(printer_id: str) -> None:
         backoff = min(backoff * 2, 60.0)
 
 
+def _moon_history_job_exists(history: list, *, moon_job_id: str, ended_at: float, job_name: str) -> bool:
+    """Return True if job_history already contains this Moonraker job."""
+    ended_ts = float(ended_at or 0.0)
+    name_norm = str(job_name or "").strip()
+    mid_norm = str(moon_job_id or "").strip()
+
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        if mid_norm and str(item.get("moon_job_id") or "").strip() == mid_norm:
+            return True
+        try:
+            item_ended = float(item.get("ended_at") or 0.0)
+        except Exception:
+            item_ended = 0.0
+        if ended_ts <= 0 or item_ended <= 0:
+            continue
+        if abs(item_ended - ended_ts) <= 1.0 and str(item.get("job_name") or "").strip() == name_norm:
+            return True
+    return False
+
+
+def _moon_sync_missing_history_jobs(printer_id: str, base: str) -> None:
+    """Backfill jobs that completed while CFSync was offline or unhealthy."""
+    st = load_state(printer_id)
+    history = st.job_history if isinstance(st.job_history, list) else []
+    if not isinstance(history, list):
+        history = []
+
+    latest_end = 0.0
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        try:
+            latest_end = max(latest_end, float(item.get("ended_at") or 0.0))
+        except Exception:
+            pass
+
+    since_ts = max(0.0, latest_end - _MOON_HISTORY_OVERLAP_SECS)
+    changed = False
+    start = 0
+    while True:
+        url = f"{base}/server/history/list?limit={_MOON_HISTORY_PAGE_LIMIT}&start={start}&order=asc"
+        if since_ts > 0:
+            url += f"&since={since_ts:.3f}"
+        data = _http_get_json(url, timeout=6.0)
+        payload = (data.get("result") or data) if isinstance(data, dict) else {}
+        jobs = payload.get("jobs") or []
+        if not isinstance(jobs, list) or not jobs:
+            break
+
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            status = str(job.get("status") or "").strip().lower()
+            if status not in _MOON_HISTORY_TERMINAL_STATES:
+                continue
+
+            try:
+                ended_at = float(job.get("end_time") or 0.0)
+            except Exception:
+                ended_at = 0.0
+            if ended_at <= 0:
+                continue
+
+            moon_job_id = str(job.get("job_id") or job.get("uid") or "").strip()
+            job_name = str(job.get("filename") or job.get("job_name") or "").strip()
+            if _moon_history_job_exists(history, moon_job_id=moon_job_id, ended_at=ended_at, job_name=job_name):
+                continue
+
+            try:
+                filament_mm = max(0.0, float(job.get("filament_used") or 0.0))
+            except Exception:
+                filament_mm = 0.0
+            if filament_mm <= 0:
+                continue
+
+            try:
+                started_at = float(job.get("start_time") or 0.0)
+            except Exception:
+                started_at = 0.0
+            if started_at <= 0 or started_at > ended_at:
+                started_at = ended_at
+
+            grams = mm_to_g("OTHER", filament_mm)
+            if grams <= 0:
+                continue
+            meters = filament_mm / 1000.0
+
+            history.append({
+                "printer_id": printer_id,
+                "job_name": job_name,
+                "reason": f"Recovered job {status}",
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "spools": [{
+                    "slot": "UNKNOWN",
+                    "spoolman_id": None,
+                    "material": "OTHER",
+                    "name": "",
+                    "manufacturer": "",
+                    "color_hex": "",
+                    "grams": round(grams, 2),
+                    "meters": round(meters, 4),
+                    "needs_link": True,
+                }],
+                "total_grams": round(grams, 2),
+                "total_meters": round(meters, 4),
+                "source": "moonraker_history",
+                "moon_job_id": moon_job_id,
+                "needs_link": True,
+            })
+            changed = True
+            print(
+                f"[MOON] ({printer_id}) Recovered missed job "
+                f"{moon_job_id or '<no-id>'} ({status}, {filament_mm:.1f}mm)"
+            )
+
+        if len(jobs) < _MOON_HISTORY_PAGE_LIMIT:
+            break
+        start += len(jobs)
+        # Hard cap to keep one sync cycle bounded.
+        if start >= (_MOON_HISTORY_PAGE_LIMIT * 10):
+            break
+
+    if changed:
+        history.sort(key=lambda x: float((x or {}).get("ended_at") or 0.0))
+        st.job_history = history[-10:]
+        save_state(printer_id, st)
+
+
 def _moon_flush_to_spoolman(
     printer_id: str,
     reason: str,
@@ -1740,6 +1883,11 @@ async def moonraker_job_poll_loop(printer_id: str) -> None:
                 )
                 _moon_job_started_at.pop(printer_id, None)
                 _moon_job_name.pop(printer_id, None)
+
+            now_ts = _now()
+            if now_ts - _moon_history_last_sync.get(printer_id, 0.0) >= _MOON_HISTORY_SYNC_INTERVAL:
+                _moon_sync_missing_history_jobs(printer_id, base)
+                _moon_history_last_sync[printer_id] = now_ts
 
         except Exception:
             # Network errors are expected when printer is off — don't log verbosely
@@ -2116,8 +2264,11 @@ def api_ui_jobs_reallocate_spool(req: JobReallocateSpoolRequest) -> ApiResponse:
     state = load_state(pid)
     history = state.job_history if isinstance(state.job_history, list) else []
 
+    target_job = None
     target_spool = None
-    req_slot = str(req.slot)
+    req_slot = str(req.slot or "").strip()
+    if not req_slot:
+        raise HTTPException(status_code=400, detail="Missing job slot")
     req_ended_at = float(req.ended_at)
     for job in reversed(history):
         if not isinstance(job, dict):
@@ -2134,7 +2285,8 @@ def api_ui_jobs_reallocate_spool(req: JobReallocateSpoolRequest) -> ApiResponse:
         for sp in spools:
             if not isinstance(sp, dict):
                 continue
-            if str(sp.get("slot") or "") == req_slot:
+            if str(sp.get("slot") or "").strip() == req_slot:
+                target_job = job
                 target_spool = sp
                 break
         if target_spool:
@@ -2188,6 +2340,25 @@ def api_ui_jobs_reallocate_spool(req: JobReallocateSpoolRequest) -> ApiResponse:
     if filament.get("vendor") is not None:
         target_spool["manufacturer"] = str((filament.get("vendor") or {}).get("name") or "")
     target_spool["color_hex"] = _normalize_color_hex(str(filament.get("color_hex") or ""))
+    target_spool["needs_link"] = False
+
+    if isinstance(target_job, dict):
+        spools_in = target_job.get("spools") or []
+        still_needs_link = False
+        if isinstance(spools_in, list):
+            for sp in spools_in:
+                if not isinstance(sp, dict):
+                    continue
+                try:
+                    grams_sp = max(0.0, float(sp.get("grams") or 0.0))
+                except Exception:
+                    grams_sp = 0.0
+                if grams_sp <= 0:
+                    continue
+                if not _spoolman_id_or_none(sp.get("spoolman_id")):
+                    still_needs_link = True
+                    break
+        target_job["needs_link"] = still_needs_link
 
     state.job_history = history[-10:]
     save_state(pid, state)

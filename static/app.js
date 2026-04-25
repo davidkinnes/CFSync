@@ -165,6 +165,7 @@ function normalizeHexColor(raw) {
 function recentJobSlotLabel(slotId) {
   const sid = String(slotId || "").toUpperCase();
   if (sid === PRINTER_SPOOL_SLOT) return "Spool";
+  if (sid === "UNKNOWN" || sid === "UNASSIGNED" || sid === "?") return "Unassigned";
   if (/^[1-4][A-D]$/.test(sid)) return `CFS Box ${sid[0]} · ${sid}`;
   return sid || "—";
 }
@@ -1373,6 +1374,8 @@ function renderRecentJobsCard(printers) {
         endedAt,
         printer: String(j.printer_id || pid || "—"),
         jobName: String(j.job_name || ""),
+        source: String(j.source || ""),
+        needsLink: !!j.needs_link,
         spools,
         totalMeters,
         totalGrams,
@@ -1433,7 +1436,11 @@ function renderRecentJobsCard(printers) {
 
     const sub = document.createElement("div");
     sub.className = "moonSub";
-    sub.textContent = `Start: ${fmtTs(j.startedAt)} · End: ${fmtTs(j.endedAt)} · Print Time: ${fmtDuration(j.startedAt, j.endedAt)}`;
+    const flags = [];
+    if (j.source === 'moonraker_history') flags.push('Recovered while offline');
+    if (j.needsLink) flags.push('Needs spool link');
+    const suffix = flags.length ? ` · ${flags.join(' · ')}` : '';
+    sub.textContent = `Start: ${fmtTs(j.startedAt)} · End: ${fmtTs(j.endedAt)} · Print Time: ${fmtDuration(j.startedAt, j.endedAt)}${suffix}`;
     entry.appendChild(sub);
 
     const spoolList = document.createElement("div");
