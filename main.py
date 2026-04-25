@@ -60,6 +60,13 @@ def _req_dump(obj, *, exclude_unset: bool = False) -> dict:
     return obj.dict(exclude_unset=exclude_unset)
 
 
+def _write_json_atomic(path: Path, data: dict) -> None:
+    """Write JSON atomically to avoid truncated files on interruption."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.replace(path)
+
+
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
@@ -222,7 +229,7 @@ def _ensure_data_files() -> None:
             "printers": {},
             "updated_at": _now(),
         }
-        STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+        _write_json_atomic(STATE_PATH, state)
 
 
 def load_profiles() -> dict:
@@ -544,15 +551,22 @@ def load_state_all() -> MultiAppState:
     except Exception as e:
         print(f"[STATE] load failed: {e}")
         _state_load_failed = True
+        # Return a safe in-memory fallback. save_state_all() will attempt to
+        # repair state.json on the next write instead of freezing persistence.
         return default_multi_state()
 
 
 def save_state_all(state: MultiAppState) -> None:
+    global _state_load_failed
     if _state_load_failed:
-        print("[STATE] save skipped: last load returned fallback default")
-        return
-    state.updated_at = _now()
-    STATE_PATH.write_text(json.dumps(_model_dump(state), indent=2, ensure_ascii=False))
+        print("[STATE] previous load failed; attempting recovery save")
+    try:
+        state.updated_at = _now()
+        _write_json_atomic(STATE_PATH, _model_dump(state))
+        _state_load_failed = False
+    except Exception as e:
+        _state_load_failed = True
+        print(f"[STATE] save failed: {e}")
 
 
 def _all_printer_ids() -> List[str]:
