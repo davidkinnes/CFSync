@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CFSync · Jobs</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="logoWrap">
+          <img src="/static/logo.png" alt="CFSync" class="logoImg" />
+        </div>
+        <div>
+          <div class="title">CFSync</div>
+          <div class="subtitle">Job History</div>
+        </div>
+      </div>
+      <div class="topbarRight">
+        <a class="btn mini" href="/">Dashboard</a>
+      </div>
+    </header>
+
+    <main class="container jobsPage">
+      <section class="card jobsFiltersCard">
+        <div class="jobsFilterGrid">
+          <div class="jobsField">
+            <label for="fPrinter">Printer</label>
+            <select id="fPrinter"></select>
+          </div>
+          <div class="jobsField">
+            <label for="fMaterial">Material</label>
+            <select id="fMaterial"></select>
+          </div>
+          <div class="jobsField">
+            <label for="fSpool">Spool ID</label>
+            <input id="fSpool" type="number" min="1" placeholder="e.g. 123" />
+          </div>
+          <div class="jobsField">
+            <label for="fNeedsLink">Needs Link</label>
+            <select id="fNeedsLink">
+              <option value="">Any</option>
+              <option value="1">Yes</option>
+              <option value="0">No</option>
+            </select>
+          </div>
+          <div class="jobsField">
+            <label for="fFrom">From</label>
+            <input id="fFrom" type="date" />
+          </div>
+          <div class="jobsField">
+            <label for="fTo">To</label>
+            <input id="fTo" type="date" />
+          </div>
+          <div class="jobsField jobsFieldWide">
+            <label for="fQuery">Search</label>
+            <input id="fQuery" type="text" placeholder="job name / reason / moon id" />
+          </div>
+        </div>
+        <div class="jobsFilterActions">
+          <button id="applyFilters" class="btn">Apply</button>
+          <button id="resetFilters" class="btn mini">Reset</button>
+          <div id="jobsSummary" class="jobsSummary">—</div>
+        </div>
+      </section>
+
+      <section class="card jobsListCard">
+        <div id="jobsList" class="moonHist"></div>
+        <div class="jobsPager">
+          <button id="prevPage" class="btn mini">Previous</button>
+          <span id="pageInfo" class="jobsSummary">Page 1</span>
+          <button id="nextPage" class="btn mini">Next</button>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/jobs.js?v=20260429-1"></script>
+  </body>
+</html>
