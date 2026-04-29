@@ -499,3 +499,25 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospa
 .spoolmanInfo{font-size:13px;color:var(--muted);flex:1}
 .spoolmanActions{display:flex;gap:8px}
 @media (max-width:560px){.spoolmanFilters{grid-template-columns:1fr}}
+
+/* --- Jobs page --- */
+.jobsPage{display:flex;flex-direction:column;gap:14px}
+.jobsFiltersCard,.jobsListCard{padding:14px}
+.jobsFilterGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.jobsField{display:flex;flex-direction:column;gap:5px;min-width:0}
+.jobsField label{font-size:12px;color:var(--muted)}
+.jobsField input,.jobsField select{
+  width:100%;
+  min-width:0;
+  padding:9px 10px;
+  border-radius:10px;
+  border:1px solid rgba(255,255,255,.12);
+  background:rgba(0,0,0,.22);
+  color:var(--text);
+}
+.jobsFieldWide{grid-column:span 2}
+.jobsFilterActions{margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.jobsSummary{font-size:12px;color:var(--muted)}
+.jobsPager{margin-top:10px;display:flex;justify-content:center;align-items:center;gap:10px}
+@media (max-width:980px){.jobsFilterGrid{grid-template-columns:repeat(2,minmax(0,1fr))}.jobsFieldWide{grid-column:span 2}}
+@media (max-width:560px){.jobsFilterGrid{grid-template-columns:1fr}.jobsFieldWide{grid-column:span 1}}

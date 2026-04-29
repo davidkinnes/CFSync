@@ -1525,7 +1525,7 @@ function renderRecentJobsCard(printers) {
   }
 
   rows.sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0));
-  const top = rows;
+  const top = rows.slice(0, 10);
 
   const block = document.createElement("section");
   block.className = "printerBlock";
@@ -1538,10 +1538,18 @@ function renderRecentJobsCard(printers) {
   title.textContent = "Recent Jobs";
   const meta = document.createElement("div");
   meta.className = "printerMeta";
-  meta.textContent = "Completed jobs";
+  meta.textContent = "Last 10 completed jobs";
   titleWrap.appendChild(title);
   titleWrap.appendChild(meta);
   head.appendChild(titleWrap);
+
+  const actions = document.createElement("div");
+  const allLink = document.createElement("a");
+  allLink.className = "btn mini";
+  allLink.href = "/jobs";
+  allLink.textContent = "View all";
+  actions.appendChild(allLink);
+  head.appendChild(actions);
   block.appendChild(head);
 
   const body = document.createElement("section");

@@ -802,6 +802,162 @@ def _job_history_fetch(printer_id: str, *, limit: Optional[int] = None) -> list:
         return out
 
 
+def _job_history_query(
+    *,
+    printer_id: Optional[str] = None,
+    material: str = "",
+    spoolman_id: Optional[int] = None,
+    needs_link: Optional[bool] = None,
+    q: str = "",
+    from_ts: Optional[float] = None,
+    to_ts: Optional[float] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list, int]:
+    _jobdb_bootstrap_if_needed()
+    where: list[str] = ["1=1"]
+    params: list = []
+
+    pid = str(printer_id or "").strip()
+    if pid:
+        where.append("j.printer_id = ?")
+        params.append(pid)
+
+    mat = str(material or "").strip().upper()
+    if mat:
+        where.append(
+            "EXISTS (SELECT 1 FROM job_spools sm WHERE sm.job_id = j.id AND UPPER(sm.material) = ?)"
+        )
+        params.append(mat)
+
+    sid = _spoolman_id_or_none(spoolman_id)
+    if sid:
+        where.append(
+            "EXISTS (SELECT 1 FROM job_spools ss WHERE ss.job_id = j.id AND ss.spoolman_id = ?)"
+        )
+        params.append(sid)
+
+    if needs_link is not None:
+        where.append("j.needs_link = ?")
+        params.append(1 if needs_link else 0)
+
+    qn = str(q or "").strip().lower()
+    if qn:
+        like = f"%{qn}%"
+        where.append(
+            "(LOWER(j.job_name) LIKE ? OR LOWER(j.reason) LIKE ? OR LOWER(j.moon_job_id) LIKE ?)"
+        )
+        params.extend([like, like, like])
+
+    if from_ts is not None:
+        where.append("j.ended_at >= ?")
+        params.append(float(from_ts))
+    if to_ts is not None:
+        where.append("j.ended_at <= ?")
+        params.append(float(to_ts))
+
+    where_sql = " AND ".join(where)
+    limit = max(1, min(200, int(limit)))
+    offset = max(0, int(offset))
+
+    with _jobdb_connect() as conn:
+        total = int(
+            conn.execute(
+                f"SELECT COUNT(*) AS c FROM jobs j WHERE {where_sql}",
+                tuple(params),
+            ).fetchone()["c"] or 0
+        )
+        job_rows = conn.execute(
+            f"""
+            SELECT id, printer_id, job_name, reason, started_at, ended_at,
+                   total_grams, total_meters, source, moon_job_id, needs_link
+            FROM jobs j
+            WHERE {where_sql}
+            ORDER BY ended_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [limit, offset]),
+        ).fetchall()
+
+        job_ids = [int(r["id"]) for r in job_rows]
+        spool_map: Dict[int, list] = {jid: [] for jid in job_ids}
+        if job_ids:
+            placeholders = ",".join(["?"] * len(job_ids))
+            spool_rows = conn.execute(
+                f"""
+                SELECT id, job_id, slot, spoolman_id, material, name, manufacturer,
+                       color_hex, grams, meters, needs_link
+                FROM job_spools
+                WHERE job_id IN ({placeholders})
+                ORDER BY id ASC
+                """,
+                tuple(job_ids),
+            ).fetchall()
+            for sp in spool_rows:
+                spool_map.setdefault(int(sp["job_id"]), []).append({
+                    "slot": str(sp["slot"] or ""),
+                    "spoolman_id": sp["spoolman_id"],
+                    "material": str(sp["material"] or ""),
+                    "name": str(sp["name"] or ""),
+                    "manufacturer": str(sp["manufacturer"] or ""),
+                    "color_hex": str(sp["color_hex"] or ""),
+                    "grams": float(sp["grams"] or 0.0),
+                    "meters": float(sp["meters"] or 0.0),
+                    "needs_link": bool(sp["needs_link"] or 0),
+                })
+
+        out: list = []
+        for row in job_rows:
+            jid = int(row["id"])
+            out.append({
+                "printer_id": str(row["printer_id"] or ""),
+                "job_name": str(row["job_name"] or ""),
+                "reason": str(row["reason"] or ""),
+                "started_at": float(row["started_at"] or 0.0),
+                "ended_at": float(row["ended_at"] or 0.0),
+                "spools": spool_map.get(jid, []),
+                "total_grams": float(row["total_grams"] or 0.0),
+                "total_meters": float(row["total_meters"] or 0.0),
+                "source": str(row["source"] or ""),
+                "moon_job_id": str(row["moon_job_id"] or ""),
+                "needs_link": bool(row["needs_link"] or 0),
+            })
+        return out, total
+
+
+def _job_history_filter_options() -> dict:
+    _jobdb_bootstrap_if_needed()
+    with _jobdb_connect() as conn:
+        db_printers = [
+            str(r["printer_id"] or "").strip()
+            for r in conn.execute(
+                "SELECT DISTINCT printer_id FROM jobs WHERE printer_id <> '' ORDER BY printer_id ASC"
+            ).fetchall()
+        ]
+        db_materials = [
+            str(r["material"] or "").strip().upper()
+            for r in conn.execute(
+                "SELECT DISTINCT material FROM job_spools WHERE material <> '' ORDER BY material ASC"
+            ).fetchall()
+        ]
+
+    cfg_printers = [str((p or {}).get("id") or "").strip() for p in (load_config().get("printers") or [])]
+    printers: list[str] = []
+    for pid in cfg_printers + db_printers:
+        if pid and pid not in printers:
+            printers.append(pid)
+
+    materials: list[str] = []
+    for mat in db_materials:
+        if mat and mat not in materials:
+            materials.append(mat)
+
+    return {
+        "printers": printers,
+        "materials": materials,
+    }
+
+
 def load_state_all() -> MultiAppState:
     global _state_load_failed
     _ensure_data_files()
@@ -2213,6 +2369,11 @@ def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
+@app.get("/jobs")
+def jobs_page():
+    return FileResponse(str(STATIC_DIR / "jobs.html"))
+
+
 # --- Public API ---
 @app.get("/api/state", response_model=AppState)
 def api_state(printer_id: Optional[str] = None):
@@ -2223,7 +2384,12 @@ def api_state(printer_id: Optional[str] = None):
 
 
 
-def _ui_state_dict(state: AppState, *, printer_id: Optional[str] = None) -> dict:
+def _ui_state_dict(
+    state: AppState,
+    *,
+    printer_id: Optional[str] = None,
+    job_limit: Optional[int] = 10,
+) -> dict:
     """Convert internal AppState to the UI payload the static frontend expects."""
     d = _model_dump(state)
     slots_in = d.get("slots", {}) or {}
@@ -2248,7 +2414,7 @@ def _ui_state_dict(state: AppState, *, printer_id: Optional[str] = None) -> dict
     d.setdefault("cfs_stats", {})
     d.setdefault("cfs_env_history", {})
     if printer_id:
-        d["job_history"] = _job_history_fetch(printer_id)
+        d["job_history"] = _job_history_fetch(printer_id, limit=job_limit)
     else:
         d.setdefault("job_history", [])
     d["job_history"] = _ui_hydrate_job_history_colors(d["job_history"])
@@ -2272,6 +2438,74 @@ def api_ui_state() -> ApiResponse:
         "spoolman_configured": bool(_spoolman_base_url()),
         "spoolman_url": _spoolman_base_url(),
     })
+
+
+@app.get("/api/ui/jobs")
+def api_ui_jobs(
+    printer_id: str = "",
+    material: str = "",
+    spoolman_id: str = "",
+    needs_link: str = "",
+    q: str = "",
+    from_ts: str = "",
+    to_ts: str = "",
+    limit: int = 50,
+    offset: int = 0,
+):
+    pid = ""
+    if str(printer_id or "").strip():
+        pid = _resolve_printer_id(str(printer_id), allow_unknown=False)
+
+    sid = _spoolman_id_or_none(spoolman_id)
+
+    needs_link_norm: Optional[bool] = None
+    nl_raw = str(needs_link or "").strip().lower()
+    if nl_raw in ("1", "true", "yes", "y"):
+        needs_link_norm = True
+    elif nl_raw in ("0", "false", "no", "n"):
+        needs_link_norm = False
+
+    from_val: Optional[float] = None
+    to_val: Optional[float] = None
+    try:
+        if str(from_ts or "").strip():
+            from_val = float(from_ts)
+    except Exception:
+        from_val = None
+    try:
+        if str(to_ts or "").strip():
+            to_val = float(to_ts)
+    except Exception:
+        to_val = None
+
+    items, total = _job_history_query(
+        printer_id=pid or None,
+        material=str(material or "").strip().upper(),
+        spoolman_id=sid,
+        needs_link=needs_link_norm,
+        q=q,
+        from_ts=from_val,
+        to_ts=to_val,
+        limit=limit,
+        offset=offset,
+    )
+    items = _ui_hydrate_job_history_colors(items)
+    return {
+        "items": items,
+        "total": total,
+        "limit": max(1, min(200, int(limit))),
+        "offset": max(0, int(offset)),
+        "filters": {
+            "printer_id": pid,
+            "material": str(material or "").strip().upper(),
+            "spoolman_id": sid,
+            "needs_link": needs_link_norm,
+            "q": str(q or "").strip(),
+            "from_ts": from_val,
+            "to_ts": to_val,
+        },
+        "options": _job_history_filter_options(),
+    }
 
 
 @app.get("/api/printers")
