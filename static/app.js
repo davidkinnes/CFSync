@@ -1014,6 +1014,21 @@ function inferLiveCfsBoxes(cfsSlots) {
   return Array.from(out).sort();
 }
 
+function connectedCfsBoxesForState(state) {
+  const st = state || {};
+  const cfsSlots = (st.cfs_slots && typeof st.cfs_slots === "object") ? st.cfs_slots : {};
+  const boxesMeta = (cfsSlots._boxes && typeof cfsSlots._boxes === "object") ? cfsSlots._boxes : {};
+
+  const byMeta = [];
+  for (const [k, v] of Object.entries(boxesMeta)) {
+    const boxNum = Number(k);
+    if (!(boxNum >= 1 && boxNum <= 4)) continue;
+    if (v && v.connected === true) byMeta.push(String(boxNum));
+  }
+  if (byMeta.length) return byMeta;
+  return inferLiveCfsBoxes(cfsSlots);
+}
+
 function renderCfsStats(state, wrap) {
   if (!wrap) return;
   wrap.innerHTML = '';
@@ -1685,7 +1700,13 @@ function render(ui) {
   const cfsBadge = $("cfsBadge");
   const total = printers.length;
   const connected = printers.filter(p => (p.state || p).printer_connected).length;
-  const cfsOk = printers.filter(p => (p.state || p).cfs_connected).length;
+  const cfsSummary = printers.reduce((acc, p) => {
+    const st = p.state || p || {};
+    const connectedBoxes = connectedCfsBoxesForState(st);
+    acc.boxes += connectedBoxes.length;
+    if (connectedBoxes.length) acc.printers += 1;
+    return acc;
+  }, { boxes: 0, printers: 0 });
 
   if (printerBadge) {
     if (!total) {
@@ -1699,7 +1720,12 @@ function render(ui) {
     if (!total) {
       badge(cfsBadge, "CFS: —", "warn");
     } else {
-      badge(cfsBadge, `CFS: ${cfsOk} detected`, cfsOk > 0 ? "ok" : "warn");
+      const boxWord = cfsSummary.boxes === 1 ? "box" : "boxes";
+      badge(
+        cfsBadge,
+        `CFS: ${cfsSummary.boxes} ${boxWord} on ${cfsSummary.printers}/${total} printers`,
+        cfsSummary.boxes > 0 ? "ok" : "warn"
+      );
     }
   }
 
