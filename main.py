@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, List
+from threading import Lock
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.parse import urlparse
 
@@ -73,6 +75,7 @@ STATIC_DIR = APP_DIR / "static"
 STATE_PATH = DATA_DIR / "state.json"
 PROFILES_PATH = DATA_DIR / "profiles.json"
 CONFIG_PATH = DATA_DIR / "config.json"
+JOB_DB_PATH = DATA_DIR / "jobs.sqlite3"
 
 DEFAULT_SLOTS = [
     "1A", "1B", "1C", "1D",
@@ -525,6 +528,278 @@ def _migrate_multi_state_dict(data: dict) -> dict:
 
 
 _state_load_failed: bool = False  # True when last load fell back to default
+_jobdb_ready: bool = False
+_jobdb_bootstrapped: bool = False
+_jobdb_lock = Lock()
+
+
+def _jobdb_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(JOB_DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _jobdb_ensure() -> None:
+    global _jobdb_ready
+    if _jobdb_ready:
+        return
+    with _jobdb_lock:
+        if _jobdb_ready:
+            return
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with _jobdb_connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    printer_id TEXT NOT NULL,
+                    job_name TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    started_at REAL NOT NULL DEFAULT 0,
+                    ended_at REAL NOT NULL DEFAULT 0,
+                    total_grams REAL NOT NULL DEFAULT 0,
+                    total_meters REAL NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT '',
+                    moon_job_id TEXT NOT NULL DEFAULT '',
+                    needs_link INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+                );
+                CREATE TABLE IF NOT EXISTS job_spools (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    slot TEXT NOT NULL DEFAULT '',
+                    spoolman_id INTEGER,
+                    material TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '',
+                    manufacturer TEXT NOT NULL DEFAULT '',
+                    color_hex TEXT NOT NULL DEFAULT '',
+                    grams REAL NOT NULL DEFAULT 0,
+                    meters REAL NOT NULL DEFAULT 0,
+                    needs_link INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_jobs_printer_ended
+                    ON jobs (printer_id, ended_at DESC, id DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_printer_moon
+                    ON jobs (printer_id, moon_job_id)
+                    WHERE moon_job_id <> '';
+                CREATE INDEX IF NOT EXISTS idx_job_spools_job
+                    ON job_spools (job_id);
+                """
+            )
+        _jobdb_ready = True
+
+
+def _job_history_insert_with_conn(conn: sqlite3.Connection, printer_id: str, job: dict, *, dedupe: bool = True) -> bool:
+    if not isinstance(job, dict):
+        return False
+    pid = str(printer_id or "").strip()
+    if not pid:
+        return False
+
+    job_name = str(job.get("job_name") or "").strip()
+    reason = str(job.get("reason") or "").strip()
+    source = str(job.get("source") or "").strip()
+    moon_job_id = str(job.get("moon_job_id") or "").strip()
+    try:
+        started_at = float(job.get("started_at") or 0.0)
+    except Exception:
+        started_at = 0.0
+    try:
+        ended_at = float(job.get("ended_at") or 0.0)
+    except Exception:
+        ended_at = 0.0
+    try:
+        total_grams = max(0.0, float(job.get("total_grams") or 0.0))
+    except Exception:
+        total_grams = 0.0
+    try:
+        total_meters = max(0.0, float(job.get("total_meters") or 0.0))
+    except Exception:
+        total_meters = 0.0
+    needs_link = 1 if bool(job.get("needs_link")) else 0
+
+    if dedupe:
+        if moon_job_id:
+            row = conn.execute(
+                "SELECT id FROM jobs WHERE printer_id=? AND moon_job_id=? LIMIT 1",
+                (pid, moon_job_id),
+            ).fetchone()
+            if row:
+                return False
+        row = conn.execute(
+            "SELECT id FROM jobs WHERE printer_id=? AND ABS(ended_at - ?) <= 1.0 AND job_name=? LIMIT 1",
+            (pid, ended_at, job_name),
+        ).fetchone()
+        if row:
+            return False
+
+    cur = conn.execute(
+        """
+        INSERT INTO jobs (
+            printer_id, job_name, reason, started_at, ended_at,
+            total_grams, total_meters, source, moon_job_id, needs_link
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            pid, job_name, reason, started_at, ended_at,
+            total_grams, total_meters, source, moon_job_id, needs_link,
+        ),
+    )
+    job_id = int(cur.lastrowid or 0)
+    if not job_id:
+        return False
+
+    spools = job.get("spools") if isinstance(job.get("spools"), list) else []
+    for sp in spools:
+        if not isinstance(sp, dict):
+            continue
+        slot = str(sp.get("slot") or "").strip()
+        spoolman_id = _spoolman_id_or_none(sp.get("spoolman_id"))
+        material = str(sp.get("material") or "").strip().upper()
+        name = str(sp.get("name") or "").strip()
+        manufacturer = str(sp.get("manufacturer") or "").strip()
+        color_hex = _normalize_color_hex(str(sp.get("color_hex") or sp.get("color") or ""))
+        try:
+            grams = max(0.0, float(sp.get("grams") or 0.0))
+        except Exception:
+            grams = 0.0
+        try:
+            meters = max(0.0, float(sp.get("meters") or 0.0))
+        except Exception:
+            meters = 0.0
+        sp_needs_link = 1 if bool(sp.get("needs_link")) else 0
+
+        conn.execute(
+            """
+            INSERT INTO job_spools (
+                job_id, slot, spoolman_id, material, name, manufacturer,
+                color_hex, grams, meters, needs_link
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                slot,
+                spoolman_id,
+                material,
+                name,
+                manufacturer,
+                color_hex,
+                grams,
+                meters,
+                sp_needs_link,
+            ),
+        )
+    return True
+
+
+def _jobdb_bootstrap_if_needed() -> None:
+    global _jobdb_bootstrapped
+    _jobdb_ensure()
+    if _jobdb_bootstrapped:
+        return
+    with _jobdb_lock:
+        if _jobdb_bootstrapped:
+            return
+        imported = 0
+        with _jobdb_connect() as conn:
+            existing = int(conn.execute("SELECT COUNT(*) AS c FROM jobs").fetchone()["c"] or 0)
+            if existing == 0:
+                st = load_state_all()
+                for pid, app_st in (st.printers or {}).items():
+                    hist = app_st.job_history if isinstance(app_st.job_history, list) else []
+                    for job in hist:
+                        if _job_history_insert_with_conn(conn, pid, job, dedupe=True):
+                            imported += 1
+                conn.commit()
+        if imported:
+            print(f"[JOBDB] Imported {imported} legacy jobs from state.json")
+        _jobdb_bootstrapped = True
+
+
+def _job_history_insert(printer_id: str, job: dict, *, dedupe: bool = True) -> bool:
+    _jobdb_bootstrap_if_needed()
+    with _jobdb_connect() as conn:
+        inserted = _job_history_insert_with_conn(conn, printer_id, job, dedupe=dedupe)
+        if inserted:
+            conn.commit()
+        return inserted
+
+
+def _job_history_fetch(printer_id: str, *, limit: Optional[int] = None) -> list:
+    _jobdb_bootstrap_if_needed()
+    pid = str(printer_id or "").strip()
+    if not pid:
+        return []
+
+    with _jobdb_connect() as conn:
+        params: list = [pid]
+        sql = """
+            SELECT id, printer_id, job_name, reason, started_at, ended_at,
+                   total_grams, total_meters, source, moon_job_id, needs_link
+            FROM jobs
+            WHERE printer_id=?
+            ORDER BY ended_at ASC, id ASC
+        """
+        if limit is not None and limit > 0:
+            sql = """
+                SELECT id, printer_id, job_name, reason, started_at, ended_at,
+                       total_grams, total_meters, source, moon_job_id, needs_link
+                FROM jobs
+                WHERE printer_id=?
+                ORDER BY ended_at DESC, id DESC
+                LIMIT ?
+            """
+            params.append(int(limit))
+        job_rows = conn.execute(sql, tuple(params)).fetchall()
+        if limit is not None and limit > 0:
+            job_rows = list(reversed(job_rows))
+
+        job_ids = [int(r["id"]) for r in job_rows]
+        spool_map: Dict[int, list] = {jid: [] for jid in job_ids}
+        if job_ids:
+            placeholders = ",".join(["?"] * len(job_ids))
+            spool_rows = conn.execute(
+                f"""
+                SELECT id, job_id, slot, spoolman_id, material, name, manufacturer,
+                       color_hex, grams, meters, needs_link
+                FROM job_spools
+                WHERE job_id IN ({placeholders})
+                ORDER BY id ASC
+                """,
+                tuple(job_ids),
+            ).fetchall()
+            for sp in spool_rows:
+                spool_map.setdefault(int(sp["job_id"]), []).append({
+                    "slot": str(sp["slot"] or ""),
+                    "spoolman_id": sp["spoolman_id"],
+                    "material": str(sp["material"] or ""),
+                    "name": str(sp["name"] or ""),
+                    "manufacturer": str(sp["manufacturer"] or ""),
+                    "color_hex": str(sp["color_hex"] or ""),
+                    "grams": float(sp["grams"] or 0.0),
+                    "meters": float(sp["meters"] or 0.0),
+                    "needs_link": bool(sp["needs_link"] or 0),
+                })
+
+        out: list = []
+        for row in job_rows:
+            jid = int(row["id"])
+            out.append({
+                "printer_id": str(row["printer_id"] or pid),
+                "job_name": str(row["job_name"] or ""),
+                "reason": str(row["reason"] or ""),
+                "started_at": float(row["started_at"] or 0.0),
+                "ended_at": float(row["ended_at"] or 0.0),
+                "spools": spool_map.get(jid, []),
+                "total_grams": float(row["total_grams"] or 0.0),
+                "total_meters": float(row["total_meters"] or 0.0),
+                "source": str(row["source"] or ""),
+                "moon_job_id": str(row["moon_job_id"] or ""),
+                "needs_link": bool(row["needs_link"] or 0),
+            })
+        return out
 
 
 def load_state_all() -> MultiAppState:
@@ -1593,10 +1868,7 @@ def _moon_history_job_exists(history: list, *, moon_job_id: str, ended_at: float
 
 def _moon_sync_missing_history_jobs(printer_id: str, base: str) -> None:
     """Backfill jobs that completed while CFSync was offline or unhealthy."""
-    st = load_state(printer_id)
-    history = st.job_history if isinstance(st.job_history, list) else []
-    if not isinstance(history, list):
-        history = []
+    history = _job_history_fetch(printer_id)
 
     latest_end = 0.0
     for item in history:
@@ -1658,7 +1930,7 @@ def _moon_sync_missing_history_jobs(printer_id: str, base: str) -> None:
                 continue
             meters = filament_mm / 1000.0
 
-            history.append({
+            job_entry = {
                 "printer_id": printer_id,
                 "job_name": job_name,
                 "reason": f"Recovered job {status}",
@@ -1680,12 +1952,15 @@ def _moon_sync_missing_history_jobs(printer_id: str, base: str) -> None:
                 "source": "moonraker_history",
                 "moon_job_id": moon_job_id,
                 "needs_link": True,
-            })
-            changed = True
-            print(
-                f"[MOON] ({printer_id}) Recovered missed job "
-                f"{moon_job_id or '<no-id>'} ({status}, {filament_mm:.1f}mm)"
-            )
+            }
+            inserted = _job_history_insert(printer_id, job_entry, dedupe=True)
+            if inserted:
+                history.append(job_entry)
+                changed = True
+                print(
+                    f"[MOON] ({printer_id}) Recovered missed job "
+                    f"{moon_job_id or '<no-id>'} ({status}, {filament_mm:.1f}mm)"
+                )
 
         if len(jobs) < _MOON_HISTORY_PAGE_LIMIT:
             break
@@ -1696,8 +1971,6 @@ def _moon_sync_missing_history_jobs(printer_id: str, base: str) -> None:
 
     if changed:
         history.sort(key=lambda x: float((x or {}).get("ended_at") or 0.0))
-        st.job_history = history[-10:]
-        save_state(printer_id, st)
 
 
 def _moon_flush_to_spoolman(
@@ -1769,8 +2042,7 @@ def _moon_flush_to_spoolman(
         stats.total_meters = round(stats.total_meters + job_mm.get(slot, 0.0) / 1000.0, 4)
         stats.last_used_at = now
         st.cfs_stats[slot] = stats
-    history = st.job_history if isinstance(st.job_history, list) else []
-    history.append({
+    _job_history_insert(printer_id, {
         "printer_id": printer_id,
         "job_name": job_name,
         "reason": reason,
@@ -1779,10 +2051,9 @@ def _moon_flush_to_spoolman(
         "spools": spools,
         "total_grams": round(total_grams, 2),
         "total_meters": round(total_meters, 4),
-    })
-    st.job_history = history[-10:]
+    }, dedupe=False)
 
-    if any(g > 0 for g in job_g.values()) or bool(st.job_history):
+    if any(g > 0 for g in job_g.values()):
         save_state(printer_id, st)
 
     _moon_job_track_slot_g[printer_id] = {}
@@ -1928,6 +2199,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 @app.on_event("startup")
 async def _startup():
     _ensure_data_files()
+    _jobdb_bootstrap_if_needed()
     printer_ids = [str((p or {}).get("id") or "") for p in (load_config().get("printers") or []) if (p or {}).get("id")]
     if not printer_ids:
         print("[BOOT] No printers configured — waiting for data/config.json")
@@ -1945,11 +2217,13 @@ def index():
 @app.get("/api/state", response_model=AppState)
 def api_state(printer_id: Optional[str] = None):
     pid = _resolve_printer_id(printer_id, allow_unknown=printer_id is None)
-    return load_state(pid)
+    st = load_state(pid)
+    st.job_history = _job_history_fetch(pid)
+    return st
 
 
 
-def _ui_state_dict(state: AppState) -> dict:
+def _ui_state_dict(state: AppState, *, printer_id: Optional[str] = None) -> dict:
     """Convert internal AppState to the UI payload the static frontend expects."""
     d = _model_dump(state)
     slots_in = d.get("slots", {}) or {}
@@ -1973,7 +2247,10 @@ def _ui_state_dict(state: AppState) -> dict:
     d.setdefault("cfs_slots", {})
     d.setdefault("cfs_stats", {})
     d.setdefault("cfs_env_history", {})
-    d.setdefault("job_history", [])
+    if printer_id:
+        d["job_history"] = _job_history_fetch(printer_id)
+    else:
+        d.setdefault("job_history", [])
     d["job_history"] = _ui_hydrate_job_history_colors(d["job_history"])
     d["spoolman_configured"] = bool(_spoolman_base_url())
     d["spoolman_url"] = _spoolman_base_url()
@@ -1987,7 +2264,7 @@ def api_ui_state() -> ApiResponse:
     printers_out = []
     for pid in _all_printer_ids():
         st = load_state(pid)
-        d = _ui_state_dict(st)
+        d = _ui_state_dict(st, printer_id=pid)
         d["printer_id"] = pid
         printers_out.append({"id": pid, "state": d})
     return ApiResponse(result={
@@ -2027,8 +2304,9 @@ def api_select_slot(req: SelectSlotRequest):
 
 @app.post("/api/ui/select_slot", response_model=ApiResponse)
 def api_ui_select_slot(req: SelectSlotRequest) -> ApiResponse:
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
     state = api_select_slot(req)
-    return ApiResponse(result=_ui_state_dict(state))
+    return ApiResponse(result=_ui_state_dict(state, printer_id=pid))
 
 
 @app.post("/api/set_auto", response_model=AppState)
@@ -2042,8 +2320,9 @@ def api_set_auto(req: SetAutoRequest):
 
 @app.post("/api/ui/set_auto", response_model=ApiResponse)
 def api_ui_set_auto(req: SetAutoRequest) -> ApiResponse:
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
     state = api_set_auto(req)
-    return ApiResponse(result=_ui_state_dict(state))
+    return ApiResponse(result=_ui_state_dict(state, printer_id=pid))
 
 
 @app.patch("/api/slots/{slot}", response_model=AppState)
@@ -2093,7 +2372,7 @@ def api_ui_slot_update(req: UiSlotUpdateRequest) -> ApiResponse:
 
     state.slots[slot] = s
     save_state(pid, state)
-    return ApiResponse(result=_ui_state_dict(state))
+    return ApiResponse(result=_ui_state_dict(state, printer_id=pid))
 
 
 
@@ -2122,7 +2401,7 @@ def api_ui_spool_set_start(req: UiSpoolSetStartRequest) -> ApiResponse:
     _ws_last_state.setdefault(pid, {}).pop(slot, None)
     _ws_last_fingerprint.setdefault(pid, {}).pop(slot, None)
     save_state(pid, state)
-    return ApiResponse(result=_ui_state_dict(state))
+    return ApiResponse(result=_ui_state_dict(state, printer_id=pid))
 
 
 
@@ -2250,7 +2529,7 @@ def api_ui_spoolman_link(req: SpoolmanLinkRequest) -> ApiResponse:
         _spoolman_set_extra(req.spoolman_id, "cfs_rfid", rfid)
         _ws_last_rfid.setdefault(pid, {})[slot] = rfid  # mark as seen so auto-link doesn't re-trigger this cycle
 
-    return ApiResponse(result=_ui_state_dict(state))
+    return ApiResponse(result=_ui_state_dict(state, printer_id=pid))
 
 
 @app.post("/api/ui/spoolman/unlink", response_model=ApiResponse)
@@ -2264,7 +2543,7 @@ def api_ui_spoolman_unlink(req: SpoolmanUnlinkRequest) -> ApiResponse:
 
     state.slots[slot].spoolman_id = None
     save_state(pid, state)
-    return ApiResponse(result=_ui_state_dict(state))
+    return ApiResponse(result=_ui_state_dict(state, printer_id=pid))
 
 
 @app.post("/api/ui/jobs/reallocate_spool", response_model=ApiResponse)
@@ -2275,38 +2554,25 @@ def api_ui_jobs_reallocate_spool(req: JobReallocateSpoolRequest) -> ApiResponse:
         raise HTTPException(status_code=400, detail="Spoolman URL not configured")
 
     pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
-    state = load_state(pid)
-    history = state.job_history if isinstance(state.job_history, list) else []
-
-    target_job = None
-    target_spool = None
     req_slot = str(req.slot or "").strip()
     if not req_slot:
         raise HTTPException(status_code=400, detail="Missing job slot")
     req_ended_at = float(req.ended_at)
-    for job in reversed(history):
-        if not isinstance(job, dict):
-            continue
-        try:
-            ended_at = float(job.get("ended_at") or 0.0)
-        except Exception:
-            ended_at = 0.0
-        if abs(ended_at - req_ended_at) > 1.0:
-            continue
-        spools = job.get("spools") or []
-        if not isinstance(spools, list):
-            continue
-        for sp in spools:
-            if not isinstance(sp, dict):
-                continue
-            if str(sp.get("slot") or "").strip() == req_slot:
-                target_job = job
-                target_spool = sp
-                break
-        if target_spool:
-            break
+    _jobdb_bootstrap_if_needed()
+    with _jobdb_connect() as conn:
+        target = conn.execute(
+            """
+            SELECT j.id AS job_id, s.id AS spool_row_id, s.spoolman_id, s.grams
+            FROM jobs AS j
+            JOIN job_spools AS s ON s.job_id = j.id
+            WHERE j.printer_id = ? AND ABS(j.ended_at - ?) <= 1.0 AND s.slot = ?
+            ORDER BY j.ended_at DESC, j.id DESC, s.id DESC
+            LIMIT 1
+            """,
+            (pid, req_ended_at, req_slot),
+        ).fetchone()
 
-    if target_spool is None:
+    if target is None:
         raise HTTPException(status_code=404, detail="Job spool entry not found")
 
     try:
@@ -2314,9 +2580,11 @@ def api_ui_jobs_reallocate_spool(req: JobReallocateSpoolRequest) -> ApiResponse:
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Spoolman unreachable: {e}")
 
-    grams = max(0.0, float(target_spool.get("grams") or 0.0))
-    old_spool_id = _spoolman_id_or_none(target_spool.get("spoolman_id"))
+    grams = max(0.0, float(target["grams"] or 0.0))
+    old_spool_id = _spoolman_id_or_none(target["spoolman_id"])
     new_spool_id = int(req.spoolman_id)
+    spool_row_id = int(target["spool_row_id"])
+    job_row_id = int(target["job_id"])
 
     # Move historical usage between Spoolman spools:
     # - Remove job usage from the new linked spool
@@ -2346,37 +2614,38 @@ def api_ui_jobs_reallocate_spool(req: JobReallocateSpoolRequest) -> ApiResponse:
             raise HTTPException(status_code=502, detail=f"Failed to move spool usage: {e}")
 
     filament = new_spool.get("filament") or {}
-    target_spool["spoolman_id"] = new_spool_id
-    if filament.get("material") is not None:
-        target_spool["material"] = str(filament.get("material") or "").upper()
-    if filament.get("name") is not None:
-        target_spool["name"] = str(filament.get("name") or "")
-    if filament.get("vendor") is not None:
-        target_spool["manufacturer"] = str((filament.get("vendor") or {}).get("name") or "")
-    target_spool["color_hex"] = _normalize_color_hex(str(filament.get("color_hex") or ""))
-    target_spool["needs_link"] = False
+    mat = str(filament.get("material") or "").upper() if filament.get("material") is not None else ""
+    name = str(filament.get("name") or "") if filament.get("name") is not None else ""
+    manufacturer = str((filament.get("vendor") or {}).get("name") or "") if filament.get("vendor") is not None else ""
+    color_hex = _normalize_color_hex(str(filament.get("color_hex") or ""))
 
-    if isinstance(target_job, dict):
-        spools_in = target_job.get("spools") or []
-        still_needs_link = False
-        if isinstance(spools_in, list):
-            for sp in spools_in:
-                if not isinstance(sp, dict):
-                    continue
-                try:
-                    grams_sp = max(0.0, float(sp.get("grams") or 0.0))
-                except Exception:
-                    grams_sp = 0.0
-                if grams_sp <= 0:
-                    continue
-                if not _spoolman_id_or_none(sp.get("spoolman_id")):
-                    still_needs_link = True
-                    break
-        target_job["needs_link"] = still_needs_link
+    with _jobdb_connect() as conn:
+        conn.execute(
+            """
+            UPDATE job_spools
+            SET spoolman_id=?, material=?, name=?, manufacturer=?, color_hex=?, needs_link=0
+            WHERE id=?
+            """,
+            (new_spool_id, mat, name, manufacturer, color_hex, spool_row_id),
+        )
+        missing_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM job_spools
+                WHERE job_id=? AND grams > 0 AND (spoolman_id IS NULL OR spoolman_id <= 0)
+                """,
+                (job_row_id,),
+            ).fetchone()["c"] or 0
+        )
+        conn.execute(
+            "UPDATE jobs SET needs_link=? WHERE id=?",
+            (1 if missing_count > 0 else 0, job_row_id),
+        )
+        conn.commit()
 
-    state.job_history = history[-10:]
-    save_state(pid, state)
-    return ApiResponse(result=_ui_state_dict(state))
+    state = load_state(pid)
+    return ApiResponse(result=_ui_state_dict(state, printer_id=pid))
 
 
 @app.get("/api/ui/spoolman/spool_detail")
@@ -2416,7 +2685,7 @@ def api_ui_set_color(req: UiSetColorRequest) -> ApiResponse:
         raise HTTPException(status_code=404, detail="Unknown slot")
     state.slots[req.slot].color_hex = req.color
     save_state(pid, state)
-    return ApiResponse(result=_ui_state_dict(state))
+    return ApiResponse(result=_ui_state_dict(state, printer_id=pid))
 
 
 
